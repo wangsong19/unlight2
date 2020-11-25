@@ -5,9 +5,12 @@
 from os import environ
 from asyncio import Protocol
 from time import time
-from httptools import HttpRequestParser, HttpParserError
-
+from httptools import HttpRequestParser, HttpParserError, parse_url
 import traceback
+
+from log import Unlight2Logger
+unlight_logger = Unlight2Logger.get_logger()
+tmp_logger = Unlight2Logger.get_tmp_logger()
 
 class SimpleHttp(Protocol):
     ''' 暂时不处理流(octet-stream)相关的内容
@@ -18,7 +21,7 @@ class SimpleHttp(Protocol):
     def __init__(self, *,
             loop,
             conns,
-            request_limit_size = 1024*4,
+            request_limit_size = 1024*8,
             request_cur_size = 0,
             request_timeout = 60,   # 消息头解析完时
             response_timeout = 60,  # 开始处理请求时
@@ -54,7 +57,6 @@ class SimpleHttp(Protocol):
         # 请求超时处理
         self.tasks.append(
                 self.loop.call_later(self.request_timeout, self.request_timeout_handler))
-        print(">>>>>>> connection_made", remote_addr)
 
     def data_received(self, data):
         if not self.parser:
@@ -66,21 +68,20 @@ class SimpleHttp(Protocol):
         if self.request_cur_size > self.request_limit_size:
             self.write_error(b"Payload Too Large")
 
-        print(">>>>>>> data_received", data)
         try:
             self.parser.feed_data(data)
         except HttpParserError:
             self.write_error(b"Bad request")
             traceback.print_exc()
 
+        tmp_logger.info(">>>> data_received", data.decode())
+
     def connection_lost(self, err):
         ''' 当连接关闭时 '''
-        if err:
-            print(err)
-        print("conn is cloesed.")
-        
         self.conns.discard(self)
         self.cancel_tasks() # 被动清理
+
+        tmp_logger.info(">>>> conn is cloesed.")
 
 
     ############################# 数据接受与处理
@@ -94,9 +95,9 @@ class SimpleHttp(Protocol):
         ''' 返回消息 '''
         try:
             self.transport.write(response)
-            print("写回了消息: ", response.decode())
+            tmp_logger.info(">>>> send msg: ", response.decode())
         except RuntimeError:
-            print("Connection lost before response written @ %s",
+            unlight_logger.error("Connection lost before response written @ %s",
                     self.request.ip if self.request else "Unknown")
         finally:
             if self._is_keep_alive:
@@ -104,23 +105,23 @@ class SimpleHttp(Protocol):
                         self.loop.call_later(self.keep_alive_timeout, self.keep_alive_timeout_handler))
                 self.cleanup()
             else:
-                print("没有设置keep_alive, 将自动关闭....")
                 self.transport.close()
                 self.transport = None
+                tmp_logger.info(">>>> is_keep_alive is False, transport closed.")
 
     def write_error(self, err):
         ''' 错误处理 '''
         try:
             self.transport.write(err)
         except RuntimeError:
-            print("Connection lost before error written @ %s",
+            unlight_logger.error("Connection lost before error written @ %s",
                     self.request.ip if self.request else "Unknown")
         finally:
             try:
                 self.transport.close()
                 self.transport = None
             except AttributeError:
-                print("Connection lost before server could close it.")
+                unlight_logger.error("Connection lost before server could close it.")
 
     def cleanup(self):
         ''' keep_alive清理此次请求, 以用于下次请求 '''
@@ -153,23 +154,20 @@ class SimpleHttp(Protocol):
     def keep_alive_timeout_handler(self):
         ''' keep_alive:返回结果后开始call_later '''
         self.cancel_tasks()
-        print("KeepAlive Timeout. Closing connection.")
         self.transport.close()
         self.transport = None
+
+        tmp_logger.info(">>>> KeepAlive Timeout. Closing connection.")
 
     ############################# 数据解析(目前暂不处理流相关)
     def on_url(self, burl):
         ''' burl: url bytes '''
-        print(">>> checkout burl: ", burl)
-
         self.request.add_burl(burl)
 
     def on_header(self, bname, bvalue):
         ''' bname: header name bytes
         bvalue: header value bytes
         '''
-        print(">>> checkout bname, bvalue: ", bname, bvalue)
-
         self.request.add_bheader(bname, bvalue)
         if bname.lower() == b"content-length" and int(bvalue) > self.request_limit_size:
             self.write_error(b"Payload Too Large.")
@@ -177,23 +175,16 @@ class SimpleHttp(Protocol):
             self.write_error(b"HTTP 1.1 \r\n\r\n100-continue\r\n")
 
     def on_header_complete(self):
-        ''' 消息头解析结束,开启返回超时任务
-        '''
-        print(">>> checkout headers analyse done.")
-
+        ''' 消息头解析结束,开启返回超时任务 '''
         self.tasks.append(
                 self.loop.call_later(self.response_timeout, self.response_timeout_handler))
 
     def on_body(self, bbody):
-        ''' bbody: body bytes'''
-        print(">>> checkout bbody: ", bbody)
-
+        ''' bbody: body bytes '''
         self.request.add_bbody(bbody)
 
     def on_message_complete(self):
         ''' 消息接受完毕,处理请求 '''
-        print(">>> checkout message complete >> handle this request.")
-
         #request_task = self.loop.create_task(
         #        self.app.handle_request(self.request, response_callback))
         #self.tasks.append(request_task)
@@ -206,7 +197,7 @@ class SimpleHttp(Protocol):
 class Request:
 
     def __init__(self, remote_addr):
-        ''' 当处理流时,考虑body使用[]
+        ''' 1. 仅解析utf-8编码
         '''
         self.remote_addr = remote_addr
         # 解析前数据
@@ -214,6 +205,13 @@ class Request:
         self.__bheaders = {}
         self.__bbody = None
         # 解析之后的数据
+        self._bschema = None
+        self._bhost = None
+        self._port = 80
+        self._bpath = None
+        self._bquery_params = {}
+        self._bfragment = None
+        self._userinfo = None
         self.raw = None
         self.form = None
         self.json = None
@@ -223,33 +221,36 @@ class Request:
         self.init_env()
 
     def init_env(self):
-        ''' 初始化局部可用的本地环境
-        (目前仅开放base_dir)
-        '''
+        ''' 初始化局部可用的本地环境(目前仅开放base_dir) '''
         base_dir = environ.get("PWD")
-        self.env = {
-            "BASE_DIR": base_dir
-        }
+        self.env = {"BASE_DIR": base_dir}
 
     def add_burl(self, burl):
         self.__burl = burl
-
-        print("---------- 查看url")
-        self.get_url()
+        # 解析url(不解码)
+        url = parse_url(burl)
+        self._bschema= url.schema
+        self._bhost = url.host
+        self._port = 443 if self._bschema == b"https" else self._port
+        self._bpath = url.path
+        self._bfragment = url.fragment
+        self._buserinfo = url.userinfo
+        if url.query:
+            qs = url.query.split(b"&")
+            for q in qs:
+                p, v = q.split(b"=")
+                self._bquery_params[p] = v
 
     def add_bheader(self, bname, bvalue):
         ''' 部分消息头对应多个字段 '''
         self.__bheaders[bname] = bvalue
 
-        print("---------- 查看headers")
-        self.get_headers()
-
     def add_bbody(self, bbody):
         ''' 暂不支持追加流 '''
         self.__bbody = bbody
-        
-        print("---------- 查看body")
-        self.get_raw()
+
+        tmp_logger.info(">>>> body : ", bbody.decode())
+        tmp_logger.info(">>>> ", self.get_raw())
 
     # 读取请求信息(查看时解析)
     # ------------------------
@@ -257,28 +258,17 @@ class Request:
         ''' 查看url '''
         url = ""
         burl = self.__burl
-        try:
-            url = burl.decode()
-        except UnicodeDecodeError:
-            url = burl.decode("latin-1")
-        print("转换之后的url::::: ", url)
+        url = burl.decode()
         return url
 
     def get_headers(self):
         ''' 查看headers '''
         headers = {}
         bheaders = self.__bheaders
-        try:
-            for bname, bvalue in bheaders.items():
-                name = bname.decode()
-                value = bvalue.decode()
-                headers[name] = value
-        except UnicodeDecodeError:
-            for bname, bvalue in bheaders.items():
-                name = bname.decode("latin-1")
-                value = bvalue.decode("latin-1")
-                headers[name] = value
-        print("转换之后的headers::::: ", headers)
+        for bname, bvalue in bheaders.items():
+            name = bname.decode()
+            value = bvalue.decode()
+            headers[name] = value
         return headers
 
     def get_raw(self):
@@ -286,13 +276,15 @@ class Request:
         if not self.raw:
             raw = ""
             bbody = self.__bbody
-            try:
-                raw = bbody.decode()
-            except UnicodeDecodeError:
-                raw = bbody.decode("latin-1")
+            raw = bbody.decode()
             self.raw = raw
-        print("转换之后的raw::::: ", raw)
         return self.raw
 
     def get_form(self):
         ''' 查看请求体(表单) '''
+
+    def get_json(self):
+        ''' 查看请求体(json) '''
+
+    def get_file(self):
+        ''' 查看请求体(文件) '''

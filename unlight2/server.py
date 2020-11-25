@@ -8,6 +8,9 @@
 # 5. 采用中间件的方式在消息上行和下行之间进行独立的处理
 # 
 
+from log import Unlight2Logger
+unlight_logger = Unlight2Logger.get_logger()
+
 import os
 from functools import partial
 import asyncio
@@ -15,7 +18,7 @@ try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 except:
-    print("warning: main loop is not uvloop, try use 'pip install -U uvloop'")
+    unlight_logger.wanrning("main loop is not uvloop, try use 'pip install -U uvloop'")
 
 class Server:
 
@@ -42,7 +45,7 @@ class Server:
         server = self.loop.run_until_complete(server_task)
 
         try:
-            print("start server as host: %s:%d"%self.address)
+            unlight_logger.info("server start (%s: %d)"%self.address)
             self.loop.run_forever()
         finally: # 暂时用interrupt来处理
             self.loop.stop()
