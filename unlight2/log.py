@@ -47,7 +47,6 @@ class UnLogger:
 
         c_handler = logging.StreamHandler()
         c_handler.setFormatter(formatter)
-        c_handler.setLevel(level) 
         logger.addHandler(c_handler)
         f_handler = TimedRotatingFileHandler(file_name, when="D", backupCount=backupCount)
         f_handler.setFormatter(formatter)
