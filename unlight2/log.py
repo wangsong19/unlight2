@@ -8,7 +8,7 @@ class UnLogger:
 
     name = "unlinght2.log"
     fmt = "[%(levelname)s][%(asctime)s] %(message)s"
-    detail_fmt = "[%(levelname)s][%(asctime)s][%(process)d][%(thread)d] --%(funcName)s-- %(message)s"
+    detail_fmt = "[%(levelname)s][%(asctime)s][pid:%(process)d][tid:%(thread)d] --%(funcName)s-- %(message)s"
 
     def __init__(self):
         raise NotImplementedError("Unlight2's log is not Implemented, use `get_logger` instead.")
