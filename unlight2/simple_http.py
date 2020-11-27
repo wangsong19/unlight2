@@ -3,14 +3,15 @@
 #
 
 from os import environ
+import re
 from asyncio import Protocol
 from time import time
 from httptools import HttpRequestParser, HttpParserError, parse_url
 import traceback
+import orjson as json
 
 from log import Unlight2Logger
 unlight_logger = Unlight2Logger.get_logger()
-tmp_logger = Unlight2Logger.get_tmp_logger()
 
 class SimpleHttp(Protocol):
     ''' 暂时不处理流(octet-stream)相关的内容
@@ -21,12 +22,12 @@ class SimpleHttp(Protocol):
     def __init__(self, *,
             loop,
             conns,
-            request_limit_size = 1024*8,
+            request_limit_size = 1024*1024*8, # 8M
             request_cur_size = 0,
             request_timeout = 60,   # 消息头解析完时
             response_timeout = 60,  # 开始处理请求时
             is_keep_alive = False,
-            keep_alive_timeout = 60 # 一次请求结束时
+            keep_alive_timeout = 10 # 一次请求结束时
             ):
 
         self.loop = loop
@@ -62,7 +63,7 @@ class SimpleHttp(Protocol):
         if not self.parser:
             self.parser = HttpRequestParser(self)
         if not self.request:
-            self.request = Request(self.remote_addr)
+            self.request = Request(self)
 
         self.request_cur_size += len(data)
         if self.request_cur_size > self.request_limit_size:
@@ -74,28 +75,28 @@ class SimpleHttp(Protocol):
             self.write_error(b"Bad request")
             traceback.print_exc()
 
-        tmp_logger.info(">>>> data_received", data.decode())
-
     def connection_lost(self, err):
         ''' 当连接关闭时 '''
         self.conns.discard(self)
         self.cancel_tasks() # 被动清理
 
-        tmp_logger.info(">>>> conn is cloesed.")
+        print(">>>> conn is cloesed.")
 
 
     ############################# 数据接受与处理
     @property
     def is_keep_alive(self):
         ''' cs端都是keepalive, 此时默认为parser已生成(建立好连接) '''
-        assert self.parser
         return self._is_keep_alive and self.parser.should_keep_alive
+    def set_keep_alive(self):
+        ''' 启用keep_alive '''
+        self._is_keep_alive = True
 
     def write_response(self, response):
         ''' 返回消息 '''
         try:
             self.transport.write(response)
-            tmp_logger.info(">>>> send msg: ", response.decode())
+            print(">>>> send msg: ", response)
         except RuntimeError:
             unlight_logger.error("Connection lost before response written @ %s",
                     self.request.ip if self.request else "Unknown")
@@ -107,7 +108,7 @@ class SimpleHttp(Protocol):
             else:
                 self.transport.close()
                 self.transport = None
-                tmp_logger.info(">>>> is_keep_alive is False, transport closed.")
+                print(">>>> is_keep_alive is False, transport closed.")
 
     def write_error(self, err):
         ''' 错误处理 '''
@@ -122,13 +123,13 @@ class SimpleHttp(Protocol):
                 self.transport = None
             except AttributeError:
                 unlight_logger.error("Connection lost before server could close it.")
+            return
 
     def cleanup(self):
         ''' keep_alive清理此次请求, 以用于下次请求 '''
         self.request_cur_size = 0
         self.parser = None
         self.request = None
-        self.cancel_tasks()
 
     def cancel_tasks(self):
         ''' 清理任务: 出错时/结束时 '''
@@ -153,11 +154,12 @@ class SimpleHttp(Protocol):
 
     def keep_alive_timeout_handler(self):
         ''' keep_alive:返回结果后开始call_later '''
+        print(">>>>> KeepAlive Timeout. Closing connection. ^^^")
         self.cancel_tasks()
         self.transport.close()
         self.transport = None
 
-        tmp_logger.info(">>>> KeepAlive Timeout. Closing connection.")
+        print(">>>> KeepAlive Timeout. Closing connection.")
 
     ############################# 数据解析(目前暂不处理流相关)
     def on_url(self, burl):
@@ -194,24 +196,22 @@ class SimpleHttp(Protocol):
         self.write_response(tb)
 
 
+bkey_pattern = re.compile(rb'name="(.*)"')
+bfile_key_pattern = re.compile(rb'name="(.*)";')
+bfile_suffix_pattern= re.compile(rb'filename=".*(\..*)";')
 class Request:
 
-    def __init__(self, remote_addr):
-        ''' 1. 仅解析utf-8编码
+    def __init__(self, transporter):
+        ''' 1. 仅解析utf-8编码(默认)
+            2. file仅支持单个文件, 多个文件使用form
         '''
-        self.remote_addr = remote_addr
+        self.__transporter = transporter
         # 解析前数据
         self.__burl = None
         self.__bheaders = {}
         self.__bbody = None
         # 解析之后的数据
-        self._bschema = None
-        self._bhost = None
-        self._port = 80
-        self._bpath = None
-        self._bquery_params = {}
-        self._bfragment = None
-        self._userinfo = None
+        self.body = None
         self.raw = None
         self.form = None
         self.json = None
@@ -226,31 +226,137 @@ class Request:
         self.env = {"BASE_DIR": base_dir}
 
     def add_burl(self, burl):
+        ''' url当前解析的参数
+            _bschema: 协议
+            _bhost: 地址
+            _port: 端口
+            _bpath: 路径
+            _bfragment: 锚点
+            _buserinfo: 用户信息(old)
+            _bquery_params: 查询参数
+        '''
         self.__burl = burl
-        # 解析url(不解码)
+        # 解析url
         url = parse_url(burl)
         self._bschema= url.schema
         self._bhost = url.host
-        self._port = 443 if self._bschema == b"https" else self._port
+        self._port = 443 if self._bschema == b"https" else 80
         self._bpath = url.path
         self._bfragment = url.fragment
         self._buserinfo = url.userinfo
+        bquery_params = {}
         if url.query:
             qs = url.query.split(b"&")
             for q in qs:
                 p, v = q.split(b"=")
-                self._bquery_params[p] = v
+                bquery_params[p] = v
+        self._bquery_params = bquery_params
 
     def add_bheader(self, bname, bvalue):
-        ''' 部分消息头对应多个字段 '''
+        ''' headers当前解析的参数, 方便后续的处理
+            _bhost: 会覆盖url的host(如果有)
+            _bconnection: 连接方式(keep_alive/close)
+            _bcontent_type: application/text; charset= ..
+            _bagent: 代理
+            _baccept: 接受mime格式
+            _baccept_encoding: 接受压缩格式
+            _bcookies: 设置cookies
+            _bcache_control: 是否使用缓存
+            _bcontent_length: 请求长度
+            _bboundary: 表单分割符
+        保留处理项:
+            1. agent阻止指定agent访问
+            2. cache-control是否使用缓存
+            3. host跨域
+        '''
+        bname = bname.strip()
         self.__bheaders[bname] = bvalue
+        l_bname = bname.lower()
+
+        if l_bname == b"host":
+            self._bhost = bvalue
+        elif l_bname == b"connection":
+            if bvalue.lower() == b"keep-alive":
+                self.__transporter.set_keep_alive()
+        elif l_bname == b"content-type":
+            self._bcontent_type = bvalue
+            if l_bname.find(b"form-data"):
+                _, bb = bvalue.split(b";")
+                bboundary = bb.split(b"=")[1].strip()
+                bboundary = b"--" + bboundary
+                self._bboundary = bboundary
+        elif l_bname == b"user-agent":
+            self._bagent = bvalue
+        elif l_bname == b"accept":
+            self._baccept = bvalue
+        elif l_bname == b"accept-encoding":
+            self._baccept_encoding = bvalue
+        elif l_bname == b"cookie":
+            self._bcookies = bvalue.split(b";")
+        elif l_bname == b"cache-control":
+            self._bcache_control = bvalue
+        elif l_bname == b"content-length":
+            self._bcontent_length = bvalue.decode()
 
     def add_bbody(self, bbody):
-        ''' 暂不支持追加流 '''
+        ''' 解析消息体:
+            1. x-www-form-urlencoded -> self.form + self.raw
+            2. form-data             -> self.form
+            3. raw(text)             -> self.raw + self.body
+            4. raw(json)             -> self.raw + self.json
+            5. binary(text)          -> self.files
+            6. binary(octect-stream) -> self.files
+            7. binary(o-MIME)        -> self.files
+        '''
         self.__bbody = bbody
+        print(">>>>>> 查看body: ", bbody)
+        
+        bcontent_type = self._bcontent_type.lower()
+        if bcontent_type.find(b"x-www-form-urlencoded") > -1:
+            data = bbody.split(b"\r\n\r\n")[1].decode()
+            self.raw = data
 
-        tmp_logger.info(">>>> body : ", bbody.decode())
-        tmp_logger.info(">>>> ", self.get_raw())
+            items = data.split("&")
+            form = {}
+            for item in items:
+                name, value = item.split("=")
+                form[name] = value
+            self.form = form
+        elif bcontent_type.find(b"form-data") > -1:
+            bboundary = self._bboundary
+            bdata_list = bbody.split(bboundary)
+            form_data = {}
+            for bitem in bdata_list:
+                bitem = bitem.strip()
+                if bitem and bitem != b"--":
+                    if bitem.find(b"\r\n\r\n") > -1:
+                        bfdes, bf = bitem.split(b"\r\n\r\n")
+                        bkey_list = bfile_key_pattern.findall(bfdes)
+                        bsuffix_list = bfile_suffix_pattern.findall(bfdes)
+                        if not bkey_list:
+                            bkey_list = [str(time()).encode()]
+                        if not bsuffix_list:
+                            bsuffix_list = [b""]
+                        if not bf:
+                            self.__transporter.write_error(b"Bad Request.")
+                        form_data[(bkey_list[0]+bsuffix_list[0]).decode()] = bf
+                    else:
+                        _, bdata = bitem.split(b";")
+                        bkey_des, bvalue = bdata.split(b"\r\n\r\n")
+                        key = key_pattern.findall(bkey_des)[0].decode()
+                        form_data[key] = bvalue.decode()
+        elif bcontent_type.find(b"text/plain") > -1:
+            self.body = self.raw = bbody.decode()
+        elif bcontent_type.find(b"json") > -1:
+            body = bbody.decode()
+            self.body = body
+            self.json = json.loads(body)
+        elif bcontent_type.find(b"octet-stream") > -1:
+            self.body = bbody
+            self.file = bbody
+        else: # other MIME(no name tag.)
+            self.file = bbody
+        
 
     # 读取请求信息(查看时解析)
     # ------------------------
@@ -272,7 +378,7 @@ class Request:
         return headers
 
     def get_raw(self):
-        ''' 查看请求体(通用格式) '''
+        ''' 查看请求体(行) '''
         if not self.raw:
             raw = ""
             bbody = self.__bbody
