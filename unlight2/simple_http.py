@@ -9,6 +9,7 @@ from time import time
 from httptools import HttpRequestParser, HttpParserError, parse_url
 import traceback
 import orjson as json
+from datetime import datetime
 
 from log import Unlight2Logger
 unlight_logger = Unlight2Logger.get_logger()
@@ -154,7 +155,6 @@ class SimpleHttp(Protocol):
 
     def keep_alive_timeout_handler(self):
         ''' keep_alive:返回结果后开始call_later '''
-        print(">>>>> KeepAlive Timeout. Closing connection. ^^^")
         self.cancel_tasks()
         self.transport.close()
         self.transport = None
@@ -192,7 +192,7 @@ class SimpleHttp(Protocol):
         #self.tasks.append(request_task)
         
         # test 写回
-        tb = b"HTTP/1.1 200 OK\r\nContent-Type: text/html;charset=utf-8\r\n\r\nhello,I am back!"
+        tb = b"HTTP/1.1 200 OK\r\ncontent-type: text/html;charset=utf-8\r\n\r\nhello,I am back!"
         self.write_response(tb)
 
 
@@ -296,7 +296,7 @@ class Request:
         elif l_bname == b"cache-control":
             self._bcache_control = bvalue
         elif l_bname == b"content-length":
-            self._bcontent_length = bvalue.decode()
+            self._bcontent_length = bvalue
 
     def add_bbody(self, bbody):
         ''' 解析消息体:
@@ -325,7 +325,7 @@ class Request:
         elif bcontent_type.find(b"form-data") > -1:
             bboundary = self._bboundary
             bdata_list = bbody.split(bboundary)
-            form_data = {}
+            form = {}
             for bitem in bdata_list:
                 bitem = bitem.strip()
                 if bitem and bitem != b"--":
@@ -339,12 +339,13 @@ class Request:
                             bsuffix_list = [b""]
                         if not bf:
                             self.__transporter.write_error(b"Bad Request.")
-                        form_data[(bkey_list[0]+bsuffix_list[0]).decode()] = bf
+                        form[(bkey_list[0]+bsuffix_list[0]).decode()] = bf
                     else:
                         _, bdata = bitem.split(b";")
                         bkey_des, bvalue = bdata.split(b"\r\n\r\n")
                         key = key_pattern.findall(bkey_des)[0].decode()
-                        form_data[key] = bvalue.decode()
+                        form[key] = bvalue.decode()
+            self.form = form
         elif bcontent_type.find(b"text/plain") > -1:
             self.body = self.raw = bbody.decode()
         elif bcontent_type.find(b"json") > -1:
@@ -378,19 +379,117 @@ class Request:
         return headers
 
     def get_raw(self):
-        ''' 查看请求体(行) '''
-        if not self.raw:
-            raw = ""
-            bbody = self.__bbody
-            raw = bbody.decode()
-            self.raw = raw
         return self.raw
 
     def get_form(self):
-        ''' 查看请求体(表单) '''
+        ''' 可以包含多个文件 '''
+        return self.form
 
     def get_json(self):
-        ''' 查看请求体(json) '''
+        return self.json
 
     def get_file(self):
-        ''' 查看请求体(文件) '''
+        ''' 可能包含不完整的文件二进制数据 '''
+        return self.file
+
+gmt_format = "%a, %d %b %Y %H:%M:%S GMT"
+class Response:
+
+    def __init__(self, version= "1.1", code=200, data=""):
+        self.version = version
+        self.code = code
+        self.headers = {
+                "Content-Type": "text/plain;charset=utf-8",
+                "Content-Length": 0,
+                "Date": datetime.utcnow().strftime(gmt_format)}
+        self.data = data
+
+    def update_version(self, version):
+        if version > self.version:
+            self.version = version
+
+    def get_code_status(self, code):
+        return STATUS_CODE_MSG.get(code, "")
+
+    def modify_headers(self, headers={}):
+        self.headers.update(headers)
+
+    def encode_headers(self):
+        ''' 编码消息头部信息 '''
+        headers = ""
+        hs = self.headers
+        for h, v in hs:
+            headers += f"{h}: {v}\r\n"
+        headers += "\r\n"
+        title = f"HTTP/{self.version} {self.code} {self.get_code_status(self.code)}\r\n"
+
+        return title.encode() + headers.encode()
+
+    def raw(self):
+        data = self.data
+        if type(data) is not bytes:
+            raise TypeError(f"the data of response {data} is not type of bytes.")
+
+        content_type = self.headers.get("Content-Type")
+        if content_type != "application/octet-stream":
+            raise TypeError(f"content type {content_type} is not suitable for `raw` function.")
+        
+        return self.encode_headers() + data
+
+    def text(self):
+        pass
+
+    def html(self):
+        pass
+
+    def json(self):
+        pass
+
+    def file(self):
+        pass
+
+
+STATUS_CODE_MSG = {
+    100: "Continue",
+    101: "Switching Protocols",
+
+    200: "OK",
+    201: "Created",
+    202: "Accepted",
+    203: "Non-Authoritative Information",
+    204: "No Content",
+    205: "Reset Content",	
+    206: "Partial Content",	
+
+    300: "Multiple Choices",
+    301: "Moved Permanently",
+    302: "Found",
+    304: "Not Modified",
+    305: "Use Proxy",
+    307: "Temporary Redirect",	
+
+    400: "Bad Request",
+    401: "Unauthorized",
+    402: "Payment Required",
+    403: "Forbidden",
+    404: "Not Found",
+    405: "Method Not Allowed",
+    406: "Not Acceptable",
+    407: "Proxy Authentication Required",
+    408: "Request Time-out",
+    409: "Conflict",
+    411: "Length Required",
+    412: "Precondition Failed",
+    413: "Request Entity Too Large",
+    414: "Request-URI Too Large",
+    415: "Unsupported Media Type",
+    416: "Requested range not satisfiable",
+    417: "Expectation Failed",
+
+    500: "Internal Server Error",
+    501: "Not Implemented",
+    502: "Bad Gateway",
+    503: "Service Unavailable",
+    504: "Gateway Time-out",
+    505: "HTTP Version not supported",
+}
