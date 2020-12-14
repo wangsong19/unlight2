@@ -11,8 +11,7 @@ import traceback
 import orjson as json
 from datetime import datetime
 
-from log import Unlight2Logger
-unlight_logger = Unlight2Logger.get_logger()
+from log import unlight_logger
 
 class SimpleHttp(Protocol):
     ''' 暂时不处理流(octet-stream)相关的内容
@@ -22,16 +21,18 @@ class SimpleHttp(Protocol):
 
     def __init__(self, *,
             loop,
+            server,
             conns,
             request_limit_size = 1024*1024*8, # 8M
             request_cur_size = 0,
-            request_timeout = 60,   # 消息头解析完时
-            response_timeout = 60,  # 开始处理请求时
+            request_timeout = 60,
+            response_timeout = 60,
             is_keep_alive = False,
-            keep_alive_timeout = 10 # 一次请求结束时
+            keep_alive_timeout = 10
             ):
 
         self.loop = loop
+        self.server = server
         self.transport = None
         self.parser = None
         self.request = None
@@ -56,7 +57,6 @@ class SimpleHttp(Protocol):
         self.conns.add(self)
 
         self.last_request_time = time()
-        # 请求超时处理
         self.tasks.append(
                 self.loop.call_later(self.request_timeout, self.request_timeout_handler))
 
@@ -77,9 +77,8 @@ class SimpleHttp(Protocol):
             traceback.print_exc()
 
     def connection_lost(self, err):
-        ''' 当连接关闭时 '''
         self.conns.discard(self)
-        self.cancel_tasks() # 被动清理
+        self.cancel_tasks()
 
         print(">>>> conn is cloesed.")
 
@@ -87,17 +86,15 @@ class SimpleHttp(Protocol):
     ############################# 数据接受与处理
     @property
     def is_keep_alive(self):
-        ''' cs端都是keepalive, 此时默认为parser已生成(建立好连接) '''
         return self._is_keep_alive and self.parser.should_keep_alive
+
     def set_keep_alive(self):
-        ''' 启用keep_alive '''
         self._is_keep_alive = True
 
-    def write_response(self, response):
-        ''' 返回消息 '''
+    def write_response(self, enc_data):
         try:
-            self.transport.write(response)
-            print(">>>> send msg: ", response)
+            self.transport.write(enc_data)
+            print(">>>> send msg: ", enc_data)
         except RuntimeError:
             unlight_logger.error("Connection lost before response written @ %s",
                     self.request.ip if self.request else "Unknown")
@@ -111,10 +108,9 @@ class SimpleHttp(Protocol):
                 self.transport = None
                 print(">>>> is_keep_alive is False, transport closed.")
 
-    def write_error(self, err):
-        ''' 错误处理 '''
+    def write_error(self, enc_err):
         try:
-            self.transport.write(err)
+            self.transport.write(enc_err)
         except RuntimeError:
             unlight_logger.error("Connection lost before error written @ %s",
                     self.request.ip if self.request else "Unknown")
@@ -124,37 +120,30 @@ class SimpleHttp(Protocol):
                 self.transport = None
             except AttributeError:
                 unlight_logger.error("Connection lost before server could close it.")
-            return
 
     def cleanup(self):
-        ''' keep_alive清理此次请求, 以用于下次请求 '''
         self.request_cur_size = 0
         self.parser = None
         self.request = None
 
     def cancel_tasks(self):
-        ''' 清理任务: 出错时/结束时 '''
         for task in self.tasks:
             task.cancel()
         self.tasks.clear()
 
     def disconnect(self):
-        ''' 主动关闭连接 '''
         self.transport.close()
         self.transport = None
 
     def request_timeout_handler(self):
-        ''' 请求超时处理:开始接受数据时开始call_later '''
         self.cancel_tasks()
         self.write_error(b"Request Timeout.")
 
     def response_timeout_handler(self):
-        ''' 返回超时处理:接受完数据开始call_later '''
         self.cancel_tasks()
         self.write_error(b"Response Timeout.")
 
     def keep_alive_timeout_handler(self):
-        ''' keep_alive:返回结果后开始call_later '''
         self.cancel_tasks()
         self.transport.close()
         self.transport = None
@@ -177,7 +166,6 @@ class SimpleHttp(Protocol):
             self.write_error(b"HTTP 1.1 \r\n\r\n100-continue\r\n")
 
     def on_header_complete(self):
-        ''' 消息头解析结束,开启返回超时任务 '''
         self.tasks.append(
                 self.loop.call_later(self.response_timeout, self.response_timeout_handler))
 
@@ -186,13 +174,12 @@ class SimpleHttp(Protocol):
         self.request.add_bbody(bbody)
 
     def on_message_complete(self):
-        ''' 消息接受完毕,处理请求 '''
         #request_task = self.loop.create_task(
-        #        self.app.handle_request(self.request, response_callback))
+        #        self.server.handle_request(self.request, self.write_response))
         #self.tasks.append(request_task)
         
         # test 写回
-        tb = b"HTTP/1.1 200 OK\r\ncontent-type: text/html;charset=utf-8\r\n\r\nhello,I am back!"
+        tb = b"HTTP/1.1 200 OK\r\ncontent-type: text/html;charset=utf-8\r\nKeep-Alive: 10\r\n\r\nhello,I am back!"
         self.write_response(tb)
 
 
@@ -202,15 +189,13 @@ bfile_suffix_pattern= re.compile(rb'filename=".*(\..*)";')
 class Request:
 
     def __init__(self, transporter):
-        ''' 1. 仅解析utf-8编码(默认)
-            2. file仅支持单个文件, 多个文件使用form
-        '''
+        ''' 1. utf-8编码(默认) '''
         self.__transporter = transporter
-        # 解析前数据
+        # bytes
         self.__burl = None
         self.__bheaders = {}
         self.__bbody = None
-        # 解析之后的数据
+        # basic data
         self.body = None
         self.raw = None
         self.form = None
@@ -221,22 +206,21 @@ class Request:
         self.init_env()
 
     def init_env(self):
-        ''' 初始化局部可用的本地环境(目前仅开放base_dir) '''
         base_dir = environ.get("PWD")
         self.env = {"BASE_DIR": base_dir}
 
     def add_burl(self, burl):
         ''' url当前解析的参数
-            _bschema: 协议
-            _bhost: 地址
-            _port: 端口
-            _bpath: 路径
-            _bfragment: 锚点
-            _buserinfo: 用户信息(old)
-            _bquery_params: 查询参数
+            _bschema
+            _bhost
+            _port
+            _bpath
+            _bfragment
+            _buserinfo
+            _bquery_params
         '''
         self.__burl = burl
-        # 解析url
+        # url
         url = parse_url(burl)
         self._bschema= url.schema
         self._bhost = url.host
@@ -253,20 +237,20 @@ class Request:
         self._bquery_params = bquery_params
 
     def add_bheader(self, bname, bvalue):
-        ''' headers当前解析的参数, 方便后续的处理
-            _bhost: 会覆盖url的host(如果有)
-            _bconnection: 连接方式(keep_alive/close)
-            _bcontent_type: application/text; charset= ..
-            _bagent: 代理
-            _baccept: 接受mime格式
-            _baccept_encoding: 接受压缩格式
-            _bcookies: 设置cookies
-            _bcache_control: 是否使用缓存
-            _bcontent_length: 请求长度
-            _bboundary: 表单分割符
-        保留处理项:
+        ''' headers
+            _bhost
+            _bconnection
+            _bcontent_type
+            _bagent
+            _baccept
+            _baccept_encoding
+            _bcookies
+            _bcache_control
+            _bcontent_length
+            _bboundary
+        保留项:
             1. agent阻止指定agent访问
-            2. cache-control是否使用缓存
+            2. cache-control缓存控制
             3. host跨域
         '''
         bname = bname.strip()
@@ -280,7 +264,7 @@ class Request:
                 self.__transporter.set_keep_alive()
         elif l_bname == b"content-type":
             self._bcontent_type = bvalue
-            if l_bname.find(b"form-data"):
+            if l_bname.find(b"form-data") > -1:
                 _, bb = bvalue.split(b";")
                 bboundary = bb.split(b"=")[1].strip()
                 bboundary = b"--" + bboundary
@@ -299,14 +283,14 @@ class Request:
             self._bcontent_length = bvalue
 
     def add_bbody(self, bbody):
-        ''' 解析消息体:
+        ''' 
             1. x-www-form-urlencoded -> self.form + self.raw
             2. form-data             -> self.form
             3. raw(text)             -> self.raw + self.body
             4. raw(json)             -> self.raw + self.json
-            5. binary(text)          -> self.files
-            6. binary(octect-stream) -> self.files
-            7. binary(o-MIME)        -> self.files
+            5. binary(text)          -> self.file
+            6. binary(octect-stream) -> self.file
+            7. binary(o-MIME)        -> self.file
         '''
         self.__bbody = bbody
         print(">>>>>> 查看body: ", bbody)
@@ -362,14 +346,12 @@ class Request:
     # 读取请求信息(查看时解析)
     # ------------------------
     def get_url(self):
-        ''' 查看url '''
         url = ""
         burl = self.__burl
         url = burl.decode()
         return url
 
     def get_headers(self):
-        ''' 查看headers '''
         headers = {}
         bheaders = self.__bheaders
         for bname, bvalue in bheaders.items():
@@ -382,15 +364,13 @@ class Request:
         return self.raw
 
     def get_form(self):
-        ''' 可以包含多个文件 '''
         return self.form
 
     def get_json(self):
         return self.json
 
     def get_file(self):
-        ''' 可能包含不完整的文件二进制数据 '''
-        return self.file
+        return self.file # maybe incomplete
 
 gmt_format = "%a, %d %b %Y %H:%M:%S GMT"
 class Response:
@@ -411,11 +391,10 @@ class Response:
     def get_code_status(self, code):
         return STATUS_CODE_MSG.get(code, "")
 
-    def modify_headers(self, headers={}):
+    def update_headers(self, headers={}):
         self.headers.update(headers)
 
     def encode_headers(self):
-        ''' 编码消息头部信息 '''
         headers = ""
         hs = self.headers
         for h, v in hs:
@@ -425,28 +404,26 @@ class Response:
 
         return title.encode() + headers.encode()
 
-    def raw(self):
-        data = self.data
-        if type(data) is not bytes:
-            raise TypeError(f"the data of response {data} is not type of bytes.")
-
-        content_type = self.headers.get("Content-Type")
-        if content_type != "application/octet-stream":
-            raise TypeError(f"content type {content_type} is not suitable for `raw` function.")
-        
-        return self.encode_headers() + data
-
     def text(self):
-        pass
+        data = self.data
+        self.headers["Content-Type"] = "text/plain"
+        return self.encode_headers + b"\r\n" + data.encode()
 
     def html(self):
-        pass
+        data = self.data
+        headers = self.headers
+        headers["Content-Type"] = "text/html"
+        return self.encode_headers + b"\r\n" + data.encode()
 
     def json(self):
-        pass
+        data = self.data
+        self.headers["Content-Type"] = "application/json"
+        return self.encode_headers + b"\r\n" + json.dumps(data)
 
     def file(self):
-        pass
+        data = self.data
+        self.headers["Content-Type"] = "application/octet-stream"
+        return self.encode_headers + b"\r\n" + data.encode()
 
 
 STATUS_CODE_MSG = {

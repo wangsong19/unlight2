@@ -97,3 +97,6 @@ class MyLogger(logging.Logger):
 
     def fatal(self, *args):
         super().fatal(" ".join(args))
+
+
+unlight_logger = Unlight2Logger.get_logger()
