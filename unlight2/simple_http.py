@@ -99,7 +99,8 @@ class SimpleHttp(Protocol):
             unlight_logger.error("Connection lost before response written @ %s",
                     self.request.ip if self.request else "Unknown")
         finally:
-            if self._is_keep_alive:
+            if self.is_keep_alive:
+                print(">>>>>> self._is_keep_alive: ", self._is_keep_alive)
                 self.tasks.append(
                         self.loop.call_later(self.keep_alive_timeout, self.keep_alive_timeout_handler))
                 self.cleanup()
@@ -174,13 +175,13 @@ class SimpleHttp(Protocol):
         self.request.add_bbody(bbody)
 
     def on_message_complete(self):
-        #request_task = self.loop.create_task(
-        #        self.server.handle_request(self.request, self.write_response))
-        #self.tasks.append(request_task)
+        request_task = self.loop.create_task(
+                self.server.handle_request(self.request, self.write_response))
+        self.tasks.append(request_task)
         
         # test 写回
-        tb = b"HTTP/1.1 200 OK\r\ncontent-type: text/html;charset=utf-8\r\nKeep-Alive: 10\r\n\r\nhello,I am back!"
-        self.write_response(tb)
+        #tb = b"HTTP/1.1 200 OK\r\nContent-Type: text/html;charset=utf-8\r\nContent-Length:16\r\nConnection: keep-alive\r\nKeep-Alive:10\r\n\r\nhello,I am back!"
+        #self.write_response(tb)
 
 
 bkey_pattern = re.compile(rb'name="(.*)"')
@@ -260,6 +261,7 @@ class Request:
         if l_bname == b"host":
             self._bhost = bvalue
         elif l_bname == b"connection":
+            print(">>>>>> l_bname, bvalue: ", l_bname, bvalue)
             if bvalue.lower() == b"keep-alive":
                 self.__transporter.set_keep_alive()
         elif l_bname == b"content-type":
