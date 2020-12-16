@@ -52,7 +52,6 @@ class Server:
         for conn in self.conns:
             conn.disconnect()
 
-    async def handle_request(self, request, response_callback):
-        tb = b"HTTP/1.1 200 OK\r\nContent-Type: text/html;charset=utf-8\r\nContent-Length:16\r\nConnection: keep-alive\r\nKeep-Alive:10\r\n\r\nhello,I am back!"
-        await asyncio.sleep(.1)
-        response_callback(tb)
+    async def handle_request(self, request, response, response_callback):
+        await asyncio.sleep(0.01) # will call async func
+        response_callback(response.file(b"test file"))

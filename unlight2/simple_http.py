@@ -27,9 +27,7 @@ class SimpleHttp(Protocol):
             request_cur_size = 0,
             request_timeout = 60,
             response_timeout = 60,
-            is_keep_alive = False,
-            keep_alive_timeout = 10
-            ):
+            keep_alive = 10):
 
         self.loop = loop
         self.server = server
@@ -42,8 +40,7 @@ class SimpleHttp(Protocol):
         self.request_cur_size = 0
         self.request_timeout = request_timeout
         self.response_timeout = response_timeout
-        self._is_keep_alive = is_keep_alive
-        self.keep_alive_timeout = keep_alive_timeout
+        self.keep_alive = keep_alive
         self.last_request_time = None
 
         self.conns = conns
@@ -79,17 +76,12 @@ class SimpleHttp(Protocol):
     def connection_lost(self, err):
         self.conns.discard(self)
         self.cancel_tasks()
-
         print(">>>> conn is cloesed.")
 
-
-    ############################# 数据接受与处理
     @property
     def is_keep_alive(self):
-        return self._is_keep_alive and self.parser.should_keep_alive
-
-    def set_keep_alive(self):
-        self._is_keep_alive = True
+        should_keep_alive = 1 if self.parser.should_keep_alive else 0
+        return should_keep_alive and self.keep_alive 
 
     def write_response(self, enc_data):
         try:
@@ -100,14 +92,12 @@ class SimpleHttp(Protocol):
                     self.request.ip if self.request else "Unknown")
         finally:
             if self.is_keep_alive:
-                print(">>>>>> self._is_keep_alive: ", self._is_keep_alive)
                 self.tasks.append(
-                        self.loop.call_later(self.keep_alive_timeout, self.keep_alive_timeout_handler))
+                        self.loop.call_later(self.keep_alive, self.keep_alive_timeout_handler))
                 self.cleanup()
             else:
                 self.transport.close()
                 self.transport = None
-                print(">>>> is_keep_alive is False, transport closed.")
 
     def write_error(self, enc_err):
         try:
@@ -175,13 +165,11 @@ class SimpleHttp(Protocol):
         self.request.add_bbody(bbody)
 
     def on_message_complete(self):
+        response = Response(keep_alive=self.is_keep_alive)
         request_task = self.loop.create_task(
-                self.server.handle_request(self.request, self.write_response))
+                self.server.handle_request(self.request, response, self.write_response))
         self.tasks.append(request_task)
         
-        # test 写回
-        #tb = b"HTTP/1.1 200 OK\r\nContent-Type: text/html;charset=utf-8\r\nContent-Length:16\r\nConnection: keep-alive\r\nKeep-Alive:10\r\n\r\nhello,I am back!"
-        #self.write_response(tb)
 
 
 bkey_pattern = re.compile(rb'name="(.*)"')
@@ -261,9 +249,7 @@ class Request:
         if l_bname == b"host":
             self._bhost = bvalue
         elif l_bname == b"connection":
-            print(">>>>>> l_bname, bvalue: ", l_bname, bvalue)
-            if bvalue.lower() == b"keep-alive":
-                self.__transporter.set_keep_alive()
+            pass
         elif l_bname == b"content-type":
             self._bcontent_type = bvalue
             if l_bname.find(b"form-data") > -1:
@@ -271,6 +257,8 @@ class Request:
                 bboundary = bb.split(b"=")[1].strip()
                 bboundary = b"--" + bboundary
                 self._bboundary = bboundary
+        elif l_bname == b"content-length":
+            self._bcontent_length = bvalue
         elif l_bname == b"user-agent":
             self._bagent = bvalue
         elif l_bname == b"accept":
@@ -281,8 +269,6 @@ class Request:
             self._bcookies = bvalue.split(b";")
         elif l_bname == b"cache-control":
             self._bcache_control = bvalue
-        elif l_bname == b"content-length":
-            self._bcontent_length = bvalue
 
     def add_bbody(self, bbody):
         ''' 
@@ -344,7 +330,6 @@ class Request:
         else: # other MIME(no name tag.)
             self.file = bbody
         
-
     # 读取请求信息(查看时解析)
     # ------------------------
     def get_url(self):
@@ -377,14 +362,20 @@ class Request:
 gmt_format = "%a, %d %b %Y %H:%M:%S GMT"
 class Response:
 
-    def __init__(self, version= "1.1", code=200, data=""):
+    def __init__(
+            self, 
+            version= "1.1", 
+            code=200, 
+            keep_alive=0):
         self.version = version
         self.code = code
-        self.headers = {
-                "Content-Type": "text/plain;charset=utf-8",
-                "Content-Length": 0,
-                "Date": datetime.utcnow().strftime(gmt_format)}
-        self.data = data
+        self.headers = {"Content-Type": "text/plain;charset=utf-8"}
+        if keep_alive:
+            self.headers.update(
+                    {"Connection": "keep-alive",
+                     "Keep-Alive": keep_alive})
+        else:
+            self.headers.update({"Connection": "close"})
 
     def update_version(self, version):
         if version > self.version:
@@ -399,33 +390,34 @@ class Response:
     def encode_headers(self):
         headers = ""
         hs = self.headers
-        for h, v in hs:
+        hs.update({"Date": datetime.utcnow().strftime(gmt_format)})
+        for h, v in hs.items():
             headers += f"{h}: {v}\r\n"
-        headers += "\r\n"
         title = f"HTTP/{self.version} {self.code} {self.get_code_status(self.code)}\r\n"
-
         return title.encode() + headers.encode()
 
-    def text(self):
-        data = self.data
+    def text(self, data):
+        enc_data = data.encode()
         self.headers["Content-Type"] = "text/plain"
-        return self.encode_headers + b"\r\n" + data.encode()
+        self.headers["Content-Length"] = len(enc_data)
+        return self.encode_headers() + b"\r\n" + enc_data
 
-    def html(self):
-        data = self.data
-        headers = self.headers
-        headers["Content-Type"] = "text/html"
-        return self.encode_headers + b"\r\n" + data.encode()
+    def html(self, data):
+        enc_data = data.encode()
+        self.headers["Content-Type"] = "text/html"
+        self.headers["Content-Length"] = len(enc_data)
+        return self.encode_headers() + b"\r\n" + enc_data
 
-    def json(self):
-        data = self.data
+    def json(self, data):
+        enc_data = json.dumps(data)
         self.headers["Content-Type"] = "application/json"
-        return self.encode_headers + b"\r\n" + json.dumps(data)
+        self.headers["Content-Length"] = len(enc_data)
+        return self.encode_headers() + b"\r\n" + enc_data
 
-    def file(self):
-        data = self.data
+    def file(self, bdata):
         self.headers["Content-Type"] = "application/octet-stream"
-        return self.encode_headers + b"\r\n" + data.encode()
+        self.headers["Content-Length"] = len(bdata)
+        return self.encode_headers() + b"\r\n" + bdata
 
 
 STATUS_CODE_MSG = {
