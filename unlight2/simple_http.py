@@ -1,8 +1,7 @@
 #
-# simple-http协议是简化版的http协议, 仅以支持http作为游戏服务器为目的
+# simple-http协议是简化版的http协议, 建议加一层代理/网关服务器
 #
 
-from os import environ
 import re
 from asyncio import Protocol
 from time import time
@@ -12,99 +11,113 @@ import orjson as json
 from datetime import datetime
 
 from log import unlight_logger
+from exception import UnlightException
 
 class SimpleHttp(Protocol):
-    ''' 暂时不处理流(octet-stream)相关的内容
-    一次性send/receive所有字节,即暂不支持流
-    媒体相关的内容.
-    '''
+
+    __slots__ = (
+        "loop",
+        "conns",
+        "router",
+        "transport",
+        "request",
+        "response",
+        "parser",
+        "request_limit_size",
+        "request_cur_size",
+        "request_timeout",
+        "response_timeout",
+        "keep_alive",
+        "last_request_time",
+        "remote_addr",
+        "request_timeout_task",
+        "response_timeout_task",
+        "conn_timeout_task"
+    )
 
     def __init__(self, *,
             loop,
-            server,
-            conns,
-            request_limit_size = 1024*1024*8, # 8M
-            request_cur_size = 0,
+            conns,  # server.conns
+            router, # path handler mgr
+            request_limit_size = 1024*1024*1, # 1M
             request_timeout = 60,
             response_timeout = 60,
             keep_alive = 10):
 
         self.loop = loop
-        self.server = server
+        self.conns = conns
+        self.router = router
         self.transport = None
-        self.parser = None
-        self.request = None
-        self.response = None
+        self.request = Request(self)
+        self.response = Response(self)
+        self.parser = HttpRequestParser(self)
 
-        self.request_limit_size= request_limit_size
+        self.request_limit_size = request_limit_size
         self.request_cur_size = 0
         self.request_timeout = request_timeout
         self.response_timeout = response_timeout
         self.keep_alive = keep_alive
-        self.last_request_time = None
+        self.last_request_time = 0
 
-        self.conns = conns
-        self.tasks = []
+        self.remote_addr = None
+        self.request_timeout_task = None
+        self.response_timeout_task = None
+        self.conn_timeout_task = None
 
-    ############################# conn base
+        self.route_mgr = None
+
     def connection_made(self, transport):
         self.transport = transport
-        remote_addr = transport.get_extra_info("peername") # tuple (ip, port)
-        self.remote_addr = remote_addr
+        self.remote_addr = transport.get_extra_info("peername")
         self.conns.add(self)
 
         self.last_request_time = time()
-        self.tasks.append(
-                self.loop.call_later(self.request_timeout, self.request_timeout_handler))
+        self.request_timeout_task = self.loop.call_later(self.request_timeout, self.request_timeout_handler)
 
     def data_received(self, data):
-        if not self.parser:
-            self.parser = HttpRequestParser(self)
-        if not self.request:
-            self.request = Request(self)
-
         self.request_cur_size += len(data)
         if self.request_cur_size > self.request_limit_size:
-            self.write_error(b"Payload Too Large")
+            self.response.error(UnlightException(413))
 
         try:
             self.parser.feed_data(data)
         except HttpParserError:
-            self.write_error(b"Bad request")
+            self.response.error(UnlightException(401))
             traceback.print_exc()
 
     def connection_lost(self, err):
         self.conns.discard(self)
-        self.cancel_tasks()
-        print(">>>> conn is cloesed.")
+        self._cancel_request_timeout_task()
+        self._cancel_response_timeout_task()
+        self._cancel_conn_timeout_task()
 
     @property
     def is_keep_alive(self):
-        should_keep_alive = 1 if self.parser.should_keep_alive else 0
-        return should_keep_alive and self.keep_alive 
+        return self.keep_alive and self.parser.should_keep_alive
 
-    def write_response(self, enc_data):
+    def write(self, enc_data):
+        ''' write and try keep alive '''
         try:
             self.transport.write(enc_data)
-            print(">>>> send msg: ", enc_data)
         except RuntimeError:
             unlight_logger.error("Connection lost before response written @ %s",
-                    self.request.ip if self.request else "Unknown")
+                    self.remote_addr if self.remote_addr else "Unknown")
         finally:
             if self.is_keep_alive:
-                self.tasks.append(
-                        self.loop.call_later(self.keep_alive, self.keep_alive_timeout_handler))
-                self.cleanup()
+                self._cancel_conn_timeout_task()
+                self.conn_timeout_task = self.loop.call_later(self.keep_alive, self.keep_alive_timeout_handler)
+                self.reset()
             else:
                 self.transport.close()
                 self.transport = None
 
-    def write_error(self, enc_err):
+    def fatal(self, enc_err):
+        ''' wirte and close '''
         try:
             self.transport.write(enc_err)
         except RuntimeError:
             unlight_logger.error("Connection lost before error written @ %s",
-                    self.request.ip if self.request else "Unknown")
+                    self.remote_addr if self.remote_addr else "Unknown")
         finally:
             try:
                 self.transport.close()
@@ -112,104 +125,133 @@ class SimpleHttp(Protocol):
             except AttributeError:
                 unlight_logger.error("Connection lost before server could close it.")
 
-    def cleanup(self):
+    def reset(self):
         self.request_cur_size = 0
-        self.parser = None
-        self.request = None
-
-    def cancel_tasks(self):
-        for task in self.tasks:
-            task.cancel()
-        self.tasks.clear()
-
-    def disconnect(self):
-        self.transport.close()
-        self.transport = None
+        self.request.reset()
+        self.response.reset()
+        self._cancel_response_timeout_task()
 
     def request_timeout_handler(self):
-        self.cancel_tasks()
-        self.write_error(b"Request Timeout.")
+        self._cancel_request_timeout_task()
+        self.response.error(UnlightException(408))
 
     def response_timeout_handler(self):
-        self.cancel_tasks()
-        self.write_error(b"Response Timeout.")
+        self._cancel_response_timeout_task();
+        self.response.error(UnlightException(502))
 
     def keep_alive_timeout_handler(self):
-        self.cancel_tasks()
+        self._cancel_request_timeout_task()
         self.transport.close()
         self.transport = None
 
-        print(">>>> KeepAlive Timeout. Closing connection.")
+    def _cancel_request_timeout_task(self):
+        if self.request_timeout_task:
+            self.request_timeout_task.cancel()
+            self.request_timeout_task = None
 
-    ############################# 数据解析(目前暂不处理流相关)
+    def _cancel_response_timeout_task(self):
+        if self.response_timeout_task:
+            self.response_timeout_task.cancel()
+            self.response_timeout_task = None
+
+    def _cancel_conn_timeout_task(self):
+        if self.conn_timeout_task:
+            self.conn_timeout_task.cancel()
+            self.conn_timeout_task = None
+
     def on_url(self, burl):
-        ''' burl: url bytes '''
         self.request.add_burl(burl)
 
     def on_header(self, bname, bvalue):
-        ''' bname: header name bytes
-        bvalue: header value bytes
-        '''
         self.request.add_bheader(bname, bvalue)
         if bname.lower() == b"content-length" and int(bvalue) > self.request_limit_size:
-            self.write_error(b"Payload Too Large.")
+            self.response.error(UnlightException(413))
         if bname.lower() == b"expect" and bvalue.lower() == b"100-continue":
-            self.write_error(b"HTTP 1.1 \r\n\r\n100-continue\r\n")
+            self.response.error(UnlightException(100))
 
     def on_header_complete(self):
-        self.tasks.append(
-                self.loop.call_later(self.response_timeout, self.response_timeout_handler))
+        self.response_timeout_task = self.loop.call_later(self.response_timeout, self.response_timeout_handler)
+        self._cancel_request_timeout_task()
 
     def on_body(self, bbody):
-        ''' bbody: body bytes '''
-        self.request.add_bbody(bbody)
+        if self.request.add_bbody(bbody) == 2:
+            self.response.error(UnlightException(400)) # parse err
 
     def on_message_complete(self):
-        response = Response(keep_alive=self.is_keep_alive)
-        request_task = self.loop.create_task(
-                self.server.handle_request(self.request, response, self.write_response))
-        self.tasks.append(request_task)
-        
+        self.request.set_method(self.parser.get_method().decode())
+        self.loop.create_task(
+                    self.router.handle_request(self.request, self.response))
 
 
 bkey_pattern = re.compile(rb'name="(.*)"')
 bfile_key_pattern = re.compile(rb'name="(.*)";')
 bfile_suffix_pattern= re.compile(rb'filename=".*(\..*)";')
 class Request:
+    __slots__ = (
+        "__protocol",
+        "__burl",
+        "__bheaders",
+        "__bbody",
+        "method",
+        "_bschema",
+        "_bhost",
+        "_port",
+        "_bpath",
+        "_bfragment",
+        "_buserinfo",
+        "_bquery_params",
+        "_bconnection",
+        "_bcontent_type",
+        "_bagent",
+        "_baccept",
+        "_baccept_encoding",
+        "_bcookies",
+        "_bcache_control",
+        "_bcontent_length",
+        "_bboundary",
+        "raw",
+        "form",
+        "json",
+        "file",
+        "env" # stash
+    )
 
-    def __init__(self, transporter):
+    def __init__(self, protocol):
         ''' 1. utf-8编码(默认) '''
-        self.__transporter = transporter
+        self.__protocol = protocol
+        self.reset()
+    
+    def reset(self):
         # bytes
         self.__burl = None
         self.__bheaders = {}
         self.__bbody = None
+        # detail byte fields
+        self._bschema = None # from url
+        self._bhost = None
+        self._port = None
+        self._bpath = None
+        self._bfragment = None
+        self._buserinfo = None
+        self._bquery_params = None
+        self._bconnection = None # from header
+        self._bcontent_type = None
+        self._bagent = None
+        self._baccept = None
+        self._baccept_encoding = None
+        self._bcookies = None
+        self._bcache_control = None
+        self._bcontent_length = None
+        self._bboundary = None
         # basic data
-        self.body = None
+        self.method = None
         self.raw = None
         self.form = None
         self.json = None
         self.file = None
 
-        #self.ctx = None
-        self.init_env()
-
-    def init_env(self):
-        base_dir = environ.get("PWD")
-        self.env = {"BASE_DIR": base_dir}
-
     def add_burl(self, burl):
-        ''' url当前解析的参数
-            _bschema
-            _bhost
-            _port
-            _bpath
-            _bfragment
-            _buserinfo
-            _bquery_params
-        '''
         self.__burl = burl
-        # url
         url = parse_url(burl)
         self._bschema= url.schema
         self._bhost = url.host
@@ -226,19 +268,7 @@ class Request:
         self._bquery_params = bquery_params
 
     def add_bheader(self, bname, bvalue):
-        ''' headers
-            _bhost
-            _bconnection
-            _bcontent_type
-            _bagent
-            _baccept
-            _baccept_encoding
-            _bcookies
-            _bcache_control
-            _bcontent_length
-            _bboundary
-        保留项:
-            1. agent阻止指定agent访问
+        ''' 1. agent阻止指定agent访问
             2. cache-control缓存控制
             3. host跨域
         '''
@@ -274,14 +304,13 @@ class Request:
         ''' 
             1. x-www-form-urlencoded -> self.form + self.raw
             2. form-data             -> self.form
-            3. raw(text)             -> self.raw + self.body
+            3. raw(text)             -> self.raw
             4. raw(json)             -> self.raw + self.json
             5. binary(text)          -> self.file
             6. binary(octect-stream) -> self.file
             7. binary(o-MIME)        -> self.file
         '''
         self.__bbody = bbody
-        print(">>>>>> 查看body: ", bbody)
         
         bcontent_type = self._bcontent_type.lower()
         if bcontent_type.find(b"x-www-form-urlencoded") > -1:
@@ -310,7 +339,7 @@ class Request:
                         if not bsuffix_list:
                             bsuffix_list = [b""]
                         if not bf:
-                            self.__transporter.write_error(b"Bad Request.")
+                            return 2
                         form[(bkey_list[0]+bsuffix_list[0]).decode()] = bf
                     else:
                         _, bdata = bitem.split(b";")
@@ -319,24 +348,26 @@ class Request:
                         form[key] = bvalue.decode()
             self.form = form
         elif bcontent_type.find(b"text/plain") > -1:
-            self.body = self.raw = bbody.decode()
+            self.raw = bbody.decode()
         elif bcontent_type.find(b"json") > -1:
             body = bbody.decode()
-            self.body = body
             self.json = json.loads(body)
         elif bcontent_type.find(b"octet-stream") > -1:
-            self.body = bbody
             self.file = bbody
         else: # other MIME(no name tag.)
             self.file = bbody
         
-    # 读取请求信息(查看时解析)
-    # ------------------------
+    def set_method(self, method):
+        self.method = method
+
+    def get_method(self):
+        return self.method
+
     def get_url(self):
-        url = ""
         burl = self.__burl
-        url = burl.decode()
-        return url
+        if burl.endswith(b"/"):
+            burl = burl[:-1]
+        return burl.decode()
 
     def get_headers(self):
         headers = {}
@@ -346,6 +377,10 @@ class Request:
             value = bvalue.decode()
             headers[name] = value
         return headers
+
+    def get_body(self):
+        bbody = self.__bbody
+        return bbody.decode()
 
     def get_raw(self):
         return self.raw
@@ -361,28 +396,37 @@ class Request:
 
 gmt_format = "%a, %d %b %Y %H:%M:%S GMT"
 class Response:
+    __slots__ = (
+        "__protocol",
+        "version",
+        "code",
+        "msg",
+        "headers",
+    )
 
-    def __init__(
-            self, 
-            version= "1.1", 
-            code=200, 
-            keep_alive=0):
+    def __init__(self, protocol, version= "1.1"):
+        self.__protocol = protocol
         self.version = version
-        self.code = code
-        self.headers = {"Content-Type": "text/plain;charset=utf-8"}
-        if keep_alive:
-            self.headers.update(
-                    {"Connection": "keep-alive",
-                     "Keep-Alive": keep_alive})
+        self.reset()
+
+    def reset(self):
+        self.code = 200
+        self.msg = "OK"
+        self.headers = {
+                "Content-Type": "text/plain;charset=utf-8",
+                "Connection": "close"} # default close
+
+    def set_keep_alive(self, keep_alive_tm=60):
+        if keep_alive_tm:
+            self.headers["Connection"] = "keep-alive"
+            self.headers["Keep-Alive"] = keep_alive_tm
         else:
-            self.headers.update({"Connection": "close"})
+            self.headers["Connection"] = "close"
+            self.headers["Keep-Alive"] = None
 
     def update_version(self, version):
         if version > self.version:
             self.version = version
-
-    def get_code_status(self, code):
-        return STATUS_CODE_MSG.get(code, "")
 
     def update_headers(self, headers={}):
         self.headers.update(headers)
@@ -390,77 +434,38 @@ class Response:
     def encode_headers(self):
         headers = ""
         hs = self.headers
-        hs.update({"Date": datetime.utcnow().strftime(gmt_format)})
         for h, v in hs.items():
-            headers += f"{h}: {v}\r\n"
-        title = f"HTTP/{self.version} {self.code} {self.get_code_status(self.code)}\r\n"
+            if v:
+                headers += f"{h}: {v}\r\n"
+        title = f"HTTP/{self.version} {self.code} {self.msg}\r\n"
         return title.encode() + headers.encode()
+
+    def error(self, unlight_exc):
+        self.code = unlight_exc.err_code
+        self.msg = unlight_exc.err_msg
+        enc_headers = self.encode_headers()
+        self.__protocol.fatal(enc_headers + b"\r\n" + b"")
+        self.reset() # reset
 
     def text(self, data):
         enc_data = data.encode()
         self.headers["Content-Type"] = "text/plain"
         self.headers["Content-Length"] = len(enc_data)
-        return self.encode_headers() + b"\r\n" + enc_data
+        self.__protocol.write(self.encode_headers() + b"\r\n" + enc_data)
 
     def html(self, data):
         enc_data = data.encode()
         self.headers["Content-Type"] = "text/html"
         self.headers["Content-Length"] = len(enc_data)
-        return self.encode_headers() + b"\r\n" + enc_data
+        self.__protocol.write(self.encode_headers() + b"\r\n" + enc_data)
 
     def json(self, data):
         enc_data = json.dumps(data)
         self.headers["Content-Type"] = "application/json"
         self.headers["Content-Length"] = len(enc_data)
-        return self.encode_headers() + b"\r\n" + enc_data
+        self.__protocol.write(self.encode_headers() + b"\r\n" + enc_data)
 
     def file(self, bdata):
         self.headers["Content-Type"] = "application/octet-stream"
         self.headers["Content-Length"] = len(bdata)
-        return self.encode_headers() + b"\r\n" + bdata
-
-
-STATUS_CODE_MSG = {
-    100: "Continue",
-    101: "Switching Protocols",
-
-    200: "OK",
-    201: "Created",
-    202: "Accepted",
-    203: "Non-Authoritative Information",
-    204: "No Content",
-    205: "Reset Content",	
-    206: "Partial Content",	
-
-    300: "Multiple Choices",
-    301: "Moved Permanently",
-    302: "Found",
-    304: "Not Modified",
-    305: "Use Proxy",
-    307: "Temporary Redirect",	
-
-    400: "Bad Request",
-    401: "Unauthorized",
-    402: "Payment Required",
-    403: "Forbidden",
-    404: "Not Found",
-    405: "Method Not Allowed",
-    406: "Not Acceptable",
-    407: "Proxy Authentication Required",
-    408: "Request Time-out",
-    409: "Conflict",
-    411: "Length Required",
-    412: "Precondition Failed",
-    413: "Request Entity Too Large",
-    414: "Request-URI Too Large",
-    415: "Unsupported Media Type",
-    416: "Requested range not satisfiable",
-    417: "Expectation Failed",
-
-    500: "Internal Server Error",
-    501: "Not Implemented",
-    502: "Bad Gateway",
-    503: "Service Unavailable",
-    504: "Gateway Time-out",
-    505: "HTTP Version not supported",
-}
+        self.__protocol.write(self.encode_headers() + b"\r\n" + bdata)
