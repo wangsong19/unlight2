@@ -1,5 +1,6 @@
 #
-# simple-http协议是简化版的http协议, 建议加一层代理/网关服务器
+# simple-http protocol is a light http protocol, you can set
+# proxy or gateway for it.
 #
 
 import re
@@ -50,6 +51,7 @@ class SimpleHttp(Protocol):
         self.transport = None
         self.request = Request(self)
         self.response = Response(self)
+        self.response.set_keep_alive()
         self.parser = HttpRequestParser(self)
 
         self.request_limit_size = request_limit_size
@@ -183,9 +185,9 @@ class SimpleHttp(Protocol):
                     self.router.handle_request(self.request, self.response))
 
 
-bkey_pattern = re.compile(rb'name="(.*)"')
-bfile_key_pattern = re.compile(rb'name="(.*)";')
-bfile_suffix_pattern= re.compile(rb'filename=".*(\..*)";')
+bkey_pattern = re.compile(rb'name="(.*)"$')
+bfile_pattern = re.compile(rb'name="(.*)";')     # as file rename
+bfile_pattern2 = re.compile(rb'filename="(.*)"') # file real name
 class Request:
     __slots__ = (
         "__protocol",
@@ -217,7 +219,7 @@ class Request:
     )
 
     def __init__(self, protocol):
-        ''' 1. utf-8编码(默认) '''
+        ''' 1. utf-8 (default) '''
         self.__protocol = protocol
         self.reset()
     
@@ -282,7 +284,7 @@ class Request:
             pass
         elif l_bname == b"content-type":
             self._bcontent_type = bvalue
-            if l_bname.find(b"form-data") > -1:
+            if bvalue.find(b"form-data") > -1:
                 _, bb = bvalue.split(b";")
                 bboundary = bb.split(b"=")[1].strip()
                 bboundary = b"--" + bboundary
@@ -332,20 +334,19 @@ class Request:
                 if bitem and bitem != b"--":
                     if bitem.find(b"\r\n\r\n") > -1:
                         bfdes, bf = bitem.split(b"\r\n\r\n")
-                        bkey_list = bfile_key_pattern.findall(bfdes)
-                        bsuffix_list = bfile_suffix_pattern.findall(bfdes)
-                        if not bkey_list:
-                            bkey_list = [str(time()).encode()]
-                        if not bsuffix_list:
-                            bsuffix_list = [b""]
-                        if not bf:
-                            return 2
-                        form[(bkey_list[0]+bsuffix_list[0]).decode()] = bf
-                    else:
-                        _, bdata = bitem.split(b";")
-                        bkey_des, bvalue = bdata.split(b"\r\n\r\n")
-                        key = key_pattern.findall(bkey_des)[0].decode()
-                        form[key] = bvalue.decode()
+                        field_keys = bkey_pattern.findall(bfdes)
+                        if field_keys: # field
+                            form[field_keys[0].decode()] = bf.decode()
+                            continue
+                        file_keys = bfile_pattern.findall(bfdes)
+                        if file_keys: # file (binary value)
+                            file_key = file_keys[0]
+                            if file_key:
+                                form[file_key.decode()] = bf
+                                continue
+                            else:
+                                file_keys = bfile_pattern2.findall(bfdes)
+                                form[file_keys[0].decode()] = bf
             self.form = form
         elif bcontent_type.find(b"text/plain") > -1:
             self.raw = bbody.decode()
@@ -378,21 +379,10 @@ class Request:
             headers[name] = value
         return headers
 
-    def get_body(self):
+    @property
+    def body(self):
         bbody = self.__bbody
         return bbody.decode()
-
-    def get_raw(self):
-        return self.raw
-
-    def get_form(self):
-        return self.form
-
-    def get_json(self):
-        return self.json
-
-    def get_file(self):
-        return self.file # maybe incomplete
 
 gmt_format = "%a, %d %b %Y %H:%M:%S GMT"
 class Response:
@@ -453,7 +443,10 @@ class Response:
         self.headers["Content-Length"] = len(enc_data)
         self.__protocol.write(self.encode_headers() + b"\r\n" + enc_data)
 
-    def html(self, data):
+    def html(self, path):
+        data = None
+        with open(path) as f:
+            data = f.read()
         enc_data = data.encode()
         self.headers["Content-Type"] = "text/html"
         self.headers["Content-Length"] = len(enc_data)
@@ -465,7 +458,11 @@ class Response:
         self.headers["Content-Length"] = len(enc_data)
         self.__protocol.write(self.encode_headers() + b"\r\n" + enc_data)
 
-    def file(self, bdata):
+    def file(self, path):
+        data = None
+        with open(path) as f:
+            data = f.read()
+        enc_data = data.encode()
         self.headers["Content-Type"] = "application/octet-stream"
-        self.headers["Content-Length"] = len(bdata)
-        self.__protocol.write(self.encode_headers() + b"\r\n" + bdata)
+        self.headers["Content-Length"] = len(enc_data)
+        self.__protocol.write(self.encode_headers() + b"\r\n" + enc_data)

@@ -1,5 +1,5 @@
 #
-# unlight异常类型
+# unlight2 exceptions
 #
 
 STATUS_CODE_MSG = {
@@ -49,6 +49,7 @@ STATUS_CODE_MSG = {
 
 
 class UnlightException(Exception):
+    __slots__ = ("err_code", "err_msg")
     
     def __init__(self, err_code):
         super(UnlightException, self).__init__()

@@ -1,18 +1,18 @@
 #
-# 仅支持GET/POST方法和静态资源访问的简单路由,
-# 期待更优的路由算法来提高路由性能和路由能力!
+# simple router for GET/POST methods and static access.
+# happy to upgrade it for more powerful!
 #
 
 from os import environ, path as ospath
 
-from log import unlight_logger
 from exception import UnlightException
+from log import get_loger
+unlight_logger = get_loger()
 
 class HttpRouter:
 
     instance = None
-    ''' aggregation and linked for all route path.
-    '''
+    ''' aggregation and linked for all route path. '''
 
     def __init__(self):
         raise NotImplementedError('''HttpRouter can not be initialized.
@@ -59,10 +59,12 @@ class HttpRouter:
             return func
         return wrapper
 
-    def set_static_dir(self, path, path_dest):
+    def set_static_dir(self, path, dest_path):
         ''' build static access dir map '''
-        fp = ospath.join(self.root_dir, path_dest)
-        if ospath.exists(fp) and ospath.is_dir(fp):
+        fp = ospath.join(self.root_dir, dest_path)
+        if ospath.exists(fp) and ospath.isdir(fp):
+            if path[0] != "/": # startswith "/"
+                path = f"/{path}"
             self.map["STATIC"][path] = ospath.join(self.root_dir, dest_path)
         else:
             raise NameError(f"static dir is not exists or not dir type: {fp}")
@@ -78,7 +80,22 @@ class HttpRouter:
         handle = None
         if method.lower() == "get":
             handle = self.map["GET"].get(path)
-            if not handle:
+            if not handle: # maybe static path
+                iter_map = self.map["STATIC"]
+                for path_key, path_dest in iter_map.items():
+                    if path.startswith(path_key):
+                        real_path = path_dest
+                        last_path = path[len(path_key):]
+
+                        if last_path[0] == "/":
+                            last_path = last_path[1:]
+                        real_path = ospath.join(real_path, last_path)
+                        if ospath.exists(real_path):
+                            if last_path.endswith("html"):
+                                response.html(real_path)
+                            else:
+                                response.file(real_path)
+                            return
                 response.error(UnlightException(404))
                 return
         elif method.lower() == "post":
@@ -86,23 +103,6 @@ class HttpRouter:
             if not handle:
                 response.error(UnlightException(404))
                 return
-        else:
-            iter_map = self.map["STATIC"]
-            for path_key, path_dest in iter_map.items():
-                if path.startswith(path_key):
-                    real_path = path_dest
-                    last_path = path[len(path_key)]
-                    if last_path[0] == "/":
-                        last_path = last_path[1:]
-                    real_path = ospath.join(real_path, last_path)
-                    if path.exists(real_path):
-                        if last_path.endswith("html"):
-                            response.html(real_path)
-                        else:
-                            response.file(real_path)
-                        return
-            response.error(UnlightException(404))
-            return
 
         try:
             await handle(request, response)

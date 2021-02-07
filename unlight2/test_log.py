@@ -1,40 +1,33 @@
-import log
-import threading
+import multiprocessing
 import time
-import unittest
+import signal
 
-class UnLoggerTest(unittest.TestCase):
+import log
 
-    @unittest.skip("ignore")
-    def test_tmp_logger(self):
-        logger = log.Unlight2Logger.get_tmp_logger()
-        logger.debug("Hello, This is debug message!", "second arg")
-        logger.info("Hello, This is info message!", "second arg")
-        logger.warning("Hello, This is warning message!", "second arg")
-        logger.error("Hello, This is error message!", "second arg")
-        logger.fatal("Hello, This is fatal message!", "second arg")
 
-    def test_logger(self):
-        flogger = log.Unlight2Logger.get_logger()
-        flogger.debug("Hello, This is file debug message!")
-        flogger.info("Hello, This is file info message!")
-        flogger.warning("Hello, This is file warning message!")
-        flogger.error("Hello, This is file error message!")
-        flogger.fatal("Hello, This is file fatal message!")
+def test_ten():
+    logger = log.get_logger(queue, "unlight2_log")
+    i = 0
+    while True:
+        if i > 120: break
+        time.sleep(1)
+        logger.info("--- you have a new log message, please record it!", i)
+        i += 1
 
-    @unittest.skip("ignore")
-    def test_rodtating_logger(self):
-        sub = threading.Thread(target=self.print_file, args=())
-        sub.start()
-        sub.join()
-        
-    @unittest.skip("ignore")
-    def print_file(self):
-        # 测试时设置rotating的when参数为'S',默认是不允许修改的
-        flogger = log.Unlight2Logger.get_detail_logger()
-        t1 = time.time()
-        t2 = time.time()
-        while t2 - t1 < 10:
-            time.sleep(0.2)
-            flogger.info("record one message in the file(console). %f" % time.time())
-            t2 = time.time()
+
+if __name__ == "__main__":
+    queue = multiprocessing.Queue(10)
+
+    worker1 = multiprocessing.Process(target=log.process_logger, args=(queue,))
+    worker1.start()
+    worker2 = multiprocessing.Process(target=test_ten)
+    worker2.start()
+
+    def handler(sig, f):
+        worker1.kill()
+        worker2.kill()
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+
+    worker1.join()
+    
