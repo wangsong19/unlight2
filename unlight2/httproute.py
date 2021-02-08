@@ -1,15 +1,14 @@
-#
-# simple router for GET/POST methods and static access.
-# happy to upgrade it for more powerful!
-#
-
 from os import environ, path as ospath
 
-from exception import UnlightException
-from log import get_loger
-unlight_logger = get_loger()
+from .exception import UnlightException
+from .lightlog import lightlog
+unlight_logger = lightlog.get_logger("unlight2")
+
 
 class HttpRouter:
+    ''' simple router for GET/POST methods and static access
+        * happy to upgrade it for more powerful! *
+    '''
 
     instance = None
     ''' aggregation and linked for all route path. '''
@@ -109,7 +108,6 @@ class HttpRouter:
         except UnlightException as e:
             unlight_logger.error("Unlight2 exception request: ------ ", e)
             response.error(e)
-            return
         except Exception as e:
             unlight_logger.error("Unlight2 error request: ------ ", e)
             response.error(UnlightException(500))

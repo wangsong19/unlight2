@@ -1,9 +1,7 @@
-from server import Server
-from simple_http import SimpleHttp
-import asyncio
+from unlight2 import server as u2
 
 # 创建服务
-server = Server(("127.0.0.1", 9919), SimpleHttp)
+server = u2.Server(("127.0.0.1", 9919))
 
 # 添加服务路由处理
 @server.router.get("/hello")
@@ -36,4 +34,4 @@ async def upload_file(request, response):
             print("--- other key: ", key, value)
     response.text("ok!")
 
-server.run_multi_process(n=2)
+server.run_multi_process(n=0)

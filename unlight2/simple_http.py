@@ -1,8 +1,3 @@
-#
-# simple-http protocol is a light http protocol, you can set
-# proxy or gateway for it.
-#
-
 import re
 from asyncio import Protocol
 from time import time
@@ -11,10 +6,16 @@ import traceback
 import orjson as json
 from datetime import datetime
 
-from log import unlight_logger
-from exception import UnlightException
+from .exception import UnlightException
+from .lightlog import lightlog
+unlight_logger = lightlog.get_logger("unlight2")
+
 
 class SimpleHttp(Protocol):
+    ''' 
+    simple-http protocol is a light http protocol,
+    you can set proxy or gateway for it 
+    '''
 
     __slots__ = (
         "loop",
