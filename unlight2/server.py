@@ -13,11 +13,8 @@ import multiprocessing as mp
 import signal
 from os import kill
 
-from log import (
-        DEFAULT_LOG_CONFIG,
-        get_logger,
-        process_logger)
 from httproute import HttpRouter
+
 
 class Server:
 
@@ -65,7 +62,6 @@ class Server:
 
             workers = []
             # starts daemon worker for log
-            queue = mp.Queue()
             unlight_logger = get_logger(queue=queue) # register `unlight2` base logger
             log_worker = mp.Process(target=process_logger, args=(queue), daemon=True)
             workers.append(log_worker)

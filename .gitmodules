@@ -1,0 +1,3 @@
+[submodule "unlight2/lightlog"]
+	path = unlight2/lightlog
+	url = https://gitee.com/wangsong19/lightlog.git
